@@ -56,8 +56,10 @@ def get_customer(customer_id: int, db: Session = Depends(get_db)):
 # table - full data breach exposing names, emails, balances, and tiers.
 @app.post("/customers/search")
 def search_customers(payload: CustomerSearch, db: Session = Depends(get_db)):
-    query = f"SELECT * FROM customers WHERE email LIKE '%{payload.email_query}%'"
-    results = db.execute(text(query)).fetchall()
+    results = db.execute(
+        text("SELECT * FROM customers WHERE email LIKE :q"),
+        {"q": f"%{payload.email_query}%"},
+    ).fetchall()
     return {"results": [dict(row._mapping) for row in results]}
 
 
@@ -77,15 +79,14 @@ def create_invoice(payload: InvoiceCreate, db: Session = Depends(get_db)):
     db.add(invoice)
     db.commit()
     db.refresh(invoice)
-    # BUG 3 - RELIABILITY (HIGH)
-    # No timeout. No try/except. Invoice is already committed to the database.
-    # If the webhook provider is slow or down, this raises an unhandled exception.
-    # The API returns HTTP 500. The caller retries. A duplicate invoice is created.
-    # The customer is double-billed with no audit trail.
-    httpx.post(
-        "https://hooks.billing-webhooks.internal/invoice-created",
-        json={"invoice_id": invoice.id, "amount": invoice.amount},
-    )
+    try:
+        httpx.post(
+            "https://hooks.billing-webhooks.internal/invoice-created",
+            json={"invoice_id": invoice.id, "amount": invoice.amount},
+            timeout=3.0,
+        )
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        print(f"Webhook notification failed (non-fatal): {exc}")
     return {"invoice_id": invoice.id, "status": invoice.status, "amount": invoice.amount}
 
 
@@ -101,7 +102,12 @@ def create_invoice(payload: InvoiceCreate, db: Session = Depends(get_db)):
 def wallet_topup(payload: WalletTopUp, db: Session = Depends(get_db)):
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Top-up amount must be positive")
-    customer = db.query(Customer).filter(Customer.id == payload.customer_id).first()
+    customer = (
+        db.query(Customer)
+        .filter(Customer.id == payload.customer_id)
+        .with_for_update()
+        .first()
+    )
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     customer.wallet_balance += payload.amount
